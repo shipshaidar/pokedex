@@ -4,14 +4,18 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"strings"
+	"sync"
+	"time"
 )
 
 func main() {
 	c := &config{
 		commands: getCommand(),
+		cache:    newCache(5 * time.Second),
 	}
 	repl(c)
 }
@@ -25,6 +29,7 @@ type cliCommand struct {
 type config struct {
 	commands map[string]cliCommand
 	reqResult
+	cache *cache
 }
 
 type reqResult struct {
@@ -37,9 +42,56 @@ type reqResult struct {
 	} `json:"results"`
 }
 
+type cache struct {
+	entries map[string]cacheEntry
+	mu      sync.Mutex
+}
+
+type cacheEntry struct {
+	createdAt time.Time
+	val       []byte
+}
+
+func newCache(interval time.Duration) *cache {
+	c := cache{
+		entries: make(map[string]cacheEntry),
+	}
+	go c.reapLoop(interval)
+	return &c
+}
+
 func cleanInput(text string) []string {
 	t := strings.ToLower(text)
 	return strings.Fields(t)
+}
+
+func (c *cache) Add(k string, v []byte) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.entries[k] = cacheEntry{
+		createdAt: time.Now(),
+		val:       v,
+	}
+}
+
+func (c *cache) Get(k string) ([]byte, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	entry, ok := c.entries[k]
+	return entry.val, ok
+}
+
+func (c *cache) reapLoop(interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	for range ticker.C {
+		c.mu.Lock()
+		for k, v := range c.entries {
+			if time.Since(v.createdAt) > interval {
+				delete(c.entries, k)
+			}
+		}
+		c.mu.Unlock()
+	}
 }
 
 func repl(cfg *config) {
@@ -114,7 +166,7 @@ func commandMap(cfg *config) error {
 	if cfg.Next != nil {
 		url = *cfg.Next
 	}
-	res, err := getLocs(url)
+	res, err := getLocs(url, cfg)
 	if err != nil {
 		return err
 	}
@@ -132,7 +184,7 @@ func commandMapb(cfg *config) error {
 		return nil
 	}
 
-	res, err := getLocs(*cfg.Previous)
+	res, err := getLocs(*cfg.Previous, cfg)
 	if err != nil {
 		return err
 	}
@@ -144,7 +196,14 @@ func commandMapb(cfg *config) error {
 	return nil
 }
 
-func getLocs(url string) (reqResult, error) {
+func getLocs(url string, cfg *config) (reqResult, error) {
+	var r reqResult
+	data, ok := cfg.cache.Get(url)
+	if ok {
+		err := json.Unmarshal(data, &r)
+		return r, err
+	}
+
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
 		return reqResult{}, err
@@ -160,8 +219,13 @@ func getLocs(url string) (reqResult, error) {
 		return reqResult{}, fmt.Errorf("%d: try again.", resp.StatusCode)
 	}
 
-	var r reqResult
-	err = json.NewDecoder(resp.Body).Decode(&r)
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return reqResult{}, err
+	}
+	cfg.cache.Add(url, body)
+
+	err = json.Unmarshal(body, &r)
 	if err != nil {
 		return reqResult{}, err
 	}
